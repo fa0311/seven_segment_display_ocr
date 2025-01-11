@@ -1,40 +1,37 @@
 import os
 import random
 import xml.etree.ElementTree as ET
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
 import numpy as np
-import tqdm
+from tqdm import tqdm
 
 from noise import NoiseImage
 
-
-def load_digit_images(digit_image_dir):
-    digit_images = {}
-    for i in range(10):
-        img_path = os.path.join(digit_image_dir, f"digit_{i}.png")
-        # グレースケールで読み込み
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        # カラーに変換
-        img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        digit_images[str(i)] = img_color
-    return digit_images
+MAX_WORKERS = None
 
 
-def create_number_image(digits_list, digit_images):
+def load_digit_images(digit_image_dir, key):
+    img_path = os.path.join(digit_image_dir, f"digit_{key}.png")
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    return img_color
+
+
+def create_number_image(digit_images):
     # 各数字を並べて一つの画像に結合します
     digit_imgs = []
     bounding_boxes = []
     x_offset = 0
     max_height = 0
-    for d in digits_list:
-        img = digit_images[d]
+    for img in digit_images:
         h, w, _ = img.shape
         max_height = max(max_height, h)
-        digit_imgs.append((img, (w, h), d))
+        digit_imgs.append((img, (w, h)))
 
-    total_width = sum([w for img, (w, h), d in digit_imgs])
+    total_width = sum([w for img, (w, h) in digit_imgs])
     # 数字間のランダムなマージンを計算
     margin = random.randint(0, 15)
     total_margin = sum(margin for _ in range(len(digit_imgs) - 1))
@@ -43,15 +40,14 @@ def create_number_image(digits_list, digit_images):
     # カラー画像として初期化
     number_image = np.zeros((max_height, total_width, 3), dtype=np.uint8)
     pad = 10
-    for i, (img, (w, h), d) in enumerate(digit_imgs):
+    for i, (img, (w, h)) in enumerate(digit_imgs):
         y_offset = (max_height - h) // 2
-        x_offset = sum([w + margin - pad for img, (w, h), d in digit_imgs[:i]])
+        x_offset = sum([w + margin - pad for img, (w, h) in digit_imgs[:i]])
         number_image[y_offset : y_offset + h, x_offset : x_offset + w] = img
         bbox = [x_offset + pad, y_offset + pad, x_offset + w - pad, y_offset + h - pad]
         bounding_boxes.append(bbox)
-    labels = [d for img, (w, h), d in digit_imgs]
 
-    return number_image, bounding_boxes, labels
+    return number_image, bounding_boxes
 
 
 def apply_random_transform(image, bounding_boxes):
@@ -267,8 +263,38 @@ def save_image_and_annotations(image, bboxes, filename_prefix, output_dir, label
     tree.write(xml_path)
 
 
-def main():
+def process_image(i):
+    output_dir = "output_images"
     digit_image_dir = "output_digits"
+
+    num_digits = random.randint(1, 3)
+    labels = [str(random.randint(0, 9)) for _ in range(num_digits)]
+    digits_list = [load_digit_images(digit_image_dir, label) for label in labels]
+    number_image, bounding_boxes = create_number_image(digits_list)
+    transformed_image, new_bounding_boxes = apply_random_transform(
+        number_image, bounding_boxes
+    )
+    colored_image, mask_inv = change_background_and_digit_colors(transformed_image)
+
+    gradient_image = add_gradient_noise(colored_image)
+
+    canvas_image, x_offset, y_offset, img_w, img_h, scale = place_on_canvas(
+        gradient_image,
+        NoiseImage().generate(N=224 * 3, count=5).astype(np.uint8),
+        mask_inv,
+    )
+
+    final_bounding_boxes = update_bounding_boxes(
+        new_bounding_boxes, x_offset, y_offset, scale
+    )
+    filename_prefix = f"augmented_{i}"
+    save_image_and_annotations(
+        canvas_image, final_bounding_boxes, filename_prefix, output_dir, labels
+    )
+    return filename_prefix
+
+
+def main():
     output_dir = "output_images"
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "JPEGImages"), exist_ok=True)
@@ -278,38 +304,19 @@ def main():
     Path.touch(Path(os.path.join(output_dir, "ImageSets", "Main", "trainval.txt")))
     Path.touch(Path(os.path.join(output_dir, "labels.txt")))
 
-    digit_images = load_digit_images(digit_image_dir)
     num_samples = 1000
     test_num = 50
     filelist = []
 
-    for i in tqdm.tqdm(range(num_samples + test_num)):
-        num_digits = random.randint(1, 3)
-        digits_list = [str(random.randint(0, 9)) for _ in range(num_digits)]
-        number_image, bounding_boxes, labels = create_number_image(
-            digits_list, digit_images
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        filelist = list(
+            tqdm(
+                executor.map(process_image, range(num_samples + test_num)),
+                total=num_samples + test_num,
+                desc="Files",
+                leave=False,
+            )
         )
-        transformed_image, new_bounding_boxes = apply_random_transform(
-            number_image, bounding_boxes
-        )
-        colored_image, mask_inv = change_background_and_digit_colors(transformed_image)
-
-        gradient_image = add_gradient_noise(colored_image)
-
-        canvas_image, x_offset, y_offset, img_w, img_h, scale = place_on_canvas(
-            gradient_image,
-            NoiseImage().generate(N=224 * 3, count=5).astype(np.uint8),
-            mask_inv,
-        )
-
-        final_bounding_boxes = update_bounding_boxes(
-            new_bounding_boxes, x_offset, y_offset, scale
-        )
-        filename_prefix = f"augmented_{i}"
-        save_image_and_annotations(
-            canvas_image, final_bounding_boxes, filename_prefix, output_dir, labels
-        )
-        filelist.append(filename_prefix)
 
     with open(os.path.join(output_dir, "ImageSets", "Main", "trainval.txt"), "w") as f:
         f.write("\n".join(filelist[:num_samples]))
