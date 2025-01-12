@@ -278,9 +278,16 @@ def process_image(i):
 
     gradient_image = add_gradient_noise(colored_image)
 
+    rand = random.random()
+    if rand < 0.2:
+        color = [random.randint(0, 255) for _ in range(3)]
+        canvas = np.full((224 * 3, 224 * 3, 3), color, dtype=np.uint8)
+    else:
+        canvas = NoiseImage().generate(N=224 * 3, count=5).astype(np.uint8)
+
     canvas_image, x_offset, y_offset, img_w, img_h, scale = place_on_canvas(
         gradient_image,
-        NoiseImage().generate(N=224 * 3, count=5).astype(np.uint8),
+        canvas,
         mask_inv,
     )
 
@@ -304,7 +311,7 @@ def main():
     Path.touch(Path(os.path.join(output_dir, "ImageSets", "Main", "trainval.txt")))
     Path.touch(Path(os.path.join(output_dir, "labels.txt")))
 
-    num_samples = 1000
+    num_samples = 10000
     test_num = 50
     filelist = []
 
